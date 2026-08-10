@@ -79,7 +79,7 @@ def sync_google_sheet_all(
     pending = pending_manifest_workflows("google_sheet")
     mark_manifest_sync(
         "google_sheet",
-        (entry["workflow_id"] for entry in pending),
+        (entry["workflow_number"] for entry in pending),
         success=True,
     )
     return GoogleSheetSyncResult(mode="full", rows_written=len(rows), rows_appended=len(rows))
@@ -183,25 +183,20 @@ def _sync_manifest_to_google_sheet(
         if number in rows_by_workflow
     ]
     missing_numbers = sorted(workflow_numbers - rows_by_workflow.keys())
-    missing_ids = [
-        str(entry["workflow_id"])
-        for entry in pending
-        if str(entry["workflow_number"]) in missing_numbers
-    ]
-    if missing_ids:
+    if missing_numbers:
         mark_manifest_sync(
             "google_sheet",
-            missing_ids,
+            missing_numbers,
             success=False,
             error=f"Workflow is missing from SQLite: {', '.join(missing_numbers)}",
         )
 
-    valid_ids = [
-        str(entry["workflow_id"])
+    valid_numbers = [
+        str(entry["workflow_number"])
         for entry in pending
         if str(entry["workflow_number"]) in rows_by_workflow
     ]
-    if not valid_ids:
+    if not valid_numbers:
         return GoogleSheetSyncResult(
             mode=mode,
             rows_written=0,
@@ -222,12 +217,12 @@ def _sync_manifest_to_google_sheet(
     except Exception as exc:
         mark_manifest_sync(
             "google_sheet",
-            valid_ids,
+            valid_numbers,
             success=False,
             error=str(exc),
         )
         raise
-    mark_manifest_sync("google_sheet", valid_ids, success=True)
+    mark_manifest_sync("google_sheet", valid_numbers, success=True)
     return GoogleSheetSyncResult(
         mode=mode,
         rows_written=rows_written,
@@ -244,9 +239,8 @@ def _step_2_pending_to_final_numbers(
 ) -> set[str]:
     triggered: set[str] = set()
     for workflow in after:
-        workflow_id = str(workflow.get("workflow_id") or "")
         workflow_number = str(workflow.get("workflow_number") or "")
-        previous = before.get(workflow_id)
+        previous = before.get(workflow_number)
         if previous is None or workflow_number not in refreshed_numbers:
             continue
         old_step_2 = _review_code(_snapshot_value(previous, "step_2_review_status"))
@@ -352,11 +346,11 @@ def _workflow_numbers_from_output(path: Path) -> set[str]:
 
 def _workflow_snapshots(workflows: list[dict[str, Any]]) -> dict[str, tuple[Any, ...]]:
     return {
-        str(workflow["workflow_id"]): tuple(
+        str(workflow["workflow_number"]): tuple(
             workflow.get(field) for field in WORKFLOW_SNAPSHOT_FIELDS
         )
         for workflow in workflows
-        if workflow.get("workflow_id")
+        if workflow.get("workflow_number")
     }
 
 

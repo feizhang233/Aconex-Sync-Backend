@@ -341,11 +341,11 @@ def _scan_mail(
         manifest_changes = []
         for workflow_number, mail_ids in changed_mail_ids.items():
             workflow = workflows_by_number.get(workflow_number)
-            if workflow is None or not workflow.get("workflow_id"):
+            if workflow is None:
                 continue
             manifest_changes.append(
                 {
-                    "workflow_id": str(workflow["workflow_id"]),
+                    "workflow_id": str(workflow.get("workflow_id") or ""),
                     "workflow_number": workflow_number,
                     "kind": "comments",
                     "changed_at": created_at,

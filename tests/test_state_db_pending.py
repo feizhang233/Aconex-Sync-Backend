@@ -39,8 +39,8 @@ class StateDbPendingWorkflowTests(unittest.TestCase):
             )
 
             self.assertEqual(
-                [row["workflow_id"] for row in get_pending_workflows(database)],
-                ["pending"],
+                [row["workflow_number"] for row in get_pending_workflows(database)],
+                ["WF-000001"],
             )
 
 

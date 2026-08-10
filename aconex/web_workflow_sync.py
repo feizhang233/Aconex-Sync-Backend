@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 import hashlib
 import json
 import re
@@ -26,6 +27,8 @@ from .workflow_update_manifest import mark_manifest_sync, pending_manifest_workf
 # DocFlow ExternalWorkflowUpdate.message is maxLength 500 in OpenAPI.
 DOCFLOW_MESSAGE_MAX_LEN = 500
 DEFAULT_DOCFLOW_MESSAGE = "Aconex workflow status synchronized."
+# Keep bulk comment import requests to a safe size.
+COMMENT_IMPORT_BATCH_SIZE = 100
 
 
 @dataclass(frozen=True)
@@ -34,6 +37,8 @@ class DocFlowPushResult:
     sent: int
     skipped: int
     failed: int
+    comments_sent: int = 0
+    comments_skipped: int = 0
 
 
 def push_workflows_to_docflow(
@@ -43,11 +48,18 @@ def push_workflows_to_docflow(
     base_url: str | None = None,
     api_key: str | None = None,
 ) -> DocFlowPushResult:
-    """Push locally stored workflow states to DocFlow without contacting Aconex."""
+    """Push locally stored workflow states and Final Mail comments to DocFlow."""
     pending = pending_manifest_workflows("docflow")
-    pending_ids = {str(entry["workflow_id"]) for entry in pending}
+    pending_by_number = {
+        str(entry["workflow_number"]): entry
+        for entry in pending
+        if entry.get("workflow_number")
+    }
+    pending_numbers = set(pending_by_number)
     if changed_only and not pending:
-        result = DocFlowPushResult(checked=0, sent=0, skipped=0, failed=0)
+        result = DocFlowPushResult(
+            checked=0, sent=0, skipped=0, failed=0, comments_sent=0, comments_skipped=0
+        )
         add_update_run(
             command="docflow-workflow-push-changed",
             notes="sent=0, skipped=0; manifest queue empty",
@@ -62,17 +74,19 @@ def push_workflows_to_docflow(
         raise ValueError("DOCFLOW_API_KEY or --api-key is required")
 
     workflows = load_workflows()
-    missing_ids: set[str] = set()
+    missing_numbers: set[str] = set()
     if changed_only:
         workflows = [
-            row for row in workflows if str(row.get("workflow_id") or "") in pending_ids
+            row
+            for row in workflows
+            if str(row.get("workflow_number") or "") in pending_numbers
         ]
-        found_ids = {str(row.get("workflow_id") or "") for row in workflows}
-        missing_ids = pending_ids - found_ids
-        if missing_ids:
+        found_numbers = {str(row.get("workflow_number") or "") for row in workflows}
+        missing_numbers = pending_numbers - found_numbers
+        if missing_numbers:
             mark_manifest_sync(
                 "docflow",
-                missing_ids,
+                missing_numbers,
                 success=False,
                 error="Workflow is missing from SQLite",
             )
@@ -80,80 +94,173 @@ def push_workflows_to_docflow(
     try:
         reviewers = _gds_as_step_2(_load_feedback_reviewers(url, headers=headers))
     except Exception as exc:
-        if pending_ids:
+        if pending_numbers:
             mark_manifest_sync(
                 "docflow",
-                (entry["workflow_id"] for entry in pending),
+                pending_numbers,
                 success=False,
                 error=str(exc),
             )
         raise
     prior_hashes = load_docflow_sync_state() if changed_only else {}
-    comments_by_number = _comments_by_workflow()
+    comments_by_number = _comment_payloads_by_workflow()
     sent = skipped = failed = 0
+    comments_sent = comments_skipped = 0
 
     with requests.Session() as session:
         session.headers.update(headers)
         for row in workflows:
-            workflow_id = str(row.get("workflow_id") or "").strip()
             workflow_number = str(row.get("workflow_number") or "").strip()
-            if not workflow_id or not workflow_number:
+            if not workflow_number:
                 failed += 1
-                print(f"Failed to publish workflow {workflow_number or '<unknown>'}: missing workflow ID or number")
-                if workflow_id in pending_ids:
-                    mark_manifest_sync(
-                        "docflow",
-                        [workflow_id],
-                        success=False,
-                        error="Missing workflow ID or number",
-                    )
+                print("Failed to publish workflow: missing workflow number")
                 continue
 
-            payload = _web_payload(
-                row,
-                reviewers,
-                comment_text=comments_by_number.get(workflow_number, ""),
-            )
-            payload_hash = _payload_hash(payload)
-            if changed_only and prior_hashes.get(workflow_id) == payload_hash:
-                mark_manifest_sync("docflow", [workflow_id], success=True)
+            comments = comments_by_number.get(workflow_number, [])
+            pending_entry = pending_by_number.get(workflow_number) or {}
+            change_types = {
+                str(value).casefold()
+                for value in (pending_entry.get("change_types") or [])
+            }
+            status_payload = _web_payload(row, reviewers)
+            sync_payload = {"status": status_payload, "comments": comments}
+            payload_hash = _payload_hash(sync_payload)
+            if changed_only and prior_hashes.get(workflow_number) == payload_hash:
+                mark_manifest_sync("docflow", [workflow_number], success=True)
                 continue
 
             try:
                 response = session.patch(
-                    _workflow_url(url, workflow_number), json=payload, timeout=30
+                    _workflow_url(url, workflow_number),
+                    json=status_payload,
+                    timeout=30,
                 )
                 if response.status_code == 404:
                     skipped += 1
-                    print(f"Skipped workflow not present in DocFlow: {workflow_number}")
+                    print(f"Skipped workflow status not present in DocFlow: {workflow_number}")
                 else:
                     response.raise_for_status()
                     sent += 1
-                # A missing DocFlow workflow is intentionally considered handled.
-                upsert_docflow_sync_state(workflow_id, payload_hash)
-                if workflow_id in pending_ids:
-                    mark_manifest_sync("docflow", [workflow_id], success=True)
+
+                # Comments are keyed by workflow number only and do not require a package.
+                should_push_comments = (not changed_only) or bool(comments) or (
+                    "comments" in change_types
+                )
+                if should_push_comments:
+                    comment_response = session.put(
+                        _workflow_comments_url(url, workflow_number),
+                        json={"comments": comments},
+                        timeout=60,
+                    )
+                    comment_response.raise_for_status()
+                    comments_sent += 1
+
+                upsert_docflow_sync_state(workflow_number, payload_hash)
+                if workflow_number in pending_numbers:
+                    mark_manifest_sync("docflow", [workflow_number], success=True)
             except requests.RequestException as exc:
                 failed += 1
                 print(f"Failed to publish workflow {workflow_number}: {exc}")
-                if workflow_id in pending_ids:
+                if workflow_number in pending_numbers:
                     mark_manifest_sync(
-                        "docflow", [workflow_id], success=False, error=str(exc)
+                        "docflow", [workflow_number], success=False, error=str(exc)
                     )
 
-    command = "docflow-workflow-push-changed" if changed_only else "docflow-workflow-push-all"
+    command = (
+        "docflow-workflow-push-changed" if changed_only else "docflow-workflow-push-all"
+    )
     result = DocFlowPushResult(
         checked=len(pending) if changed_only else len(workflows),
         sent=sent,
         skipped=skipped,
-        failed=failed + (len(missing_ids) if changed_only else 0),
+        failed=failed + (len(missing_numbers) if changed_only else 0),
+        comments_sent=comments_sent,
+        comments_skipped=comments_skipped,
     )
     add_update_run(
         command=command,
         checked_count=result.checked,
         changed_count=result.sent + result.skipped,
         failed_count=result.failed,
-        notes=f"sent={result.sent}, skipped={result.skipped}",
+        notes=(
+            f"sent={result.sent}, skipped={result.skipped}, "
+            f"comments_sent={result.comments_sent}, "
+            f"comments_skipped={result.comments_skipped}"
+        ),
+    )
+    return result
+
+
+def push_workflow_comments_to_docflow(
+    settings: Settings,
+    *,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    batch_size: int = COMMENT_IMPORT_BATCH_SIZE,
+) -> DocFlowPushResult:
+    """Import every SQLite Final Mail comment snapshot into DocFlow.
+
+    Uses ``PUT /api/external/workflow-comments`` so Aconex can push the full
+    local ``workflow_comments`` table without contacting Aconex itself.
+    """
+    url = (base_url or settings.docflow_base_url).rstrip("/")
+    key = api_key or settings.docflow_api_key
+    if not url:
+        raise ValueError("DOCFLOW_BASE_URL or --web-base-url is required")
+    if not key:
+        raise ValueError("DOCFLOW_API_KEY or --api-key is required")
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
+
+    comments_by_number = _comment_payloads_by_workflow()
+    items = [
+        {"workflow_number": workflow_number, "comments": comments}
+        for workflow_number, comments in sorted(comments_by_number.items())
+    ]
+    if not items:
+        result = DocFlowPushResult(
+            checked=0, sent=0, skipped=0, failed=0, comments_sent=0, comments_skipped=0
+        )
+        add_update_run(
+            command="docflow-comments-push-all",
+            notes="no workflow comments in SQLite",
+        )
+        return result
+
+    headers = _docflow_headers(settings, key)
+    imported = failed = 0
+    import_url = _bulk_comments_url(url)
+
+    with requests.Session() as session:
+        session.headers.update(headers)
+        for batch in _chunked(items, batch_size):
+            try:
+                response = session.put(
+                    import_url,
+                    json={"items": batch},
+                    timeout=120,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                imported += int(payload.get("imported") or 0)
+            except (requests.RequestException, ValueError, TypeError) as exc:
+                failed += len(batch)
+                print(f"Failed to import workflow comments batch ({len(batch)} items): {exc}")
+
+    result = DocFlowPushResult(
+        checked=len(items),
+        sent=0,
+        skipped=0,
+        failed=failed,
+        comments_sent=imported,
+        comments_skipped=0,
+    )
+    add_update_run(
+        command="docflow-comments-push-all",
+        checked_count=result.checked,
+        changed_count=result.comments_sent,
+        failed_count=result.failed,
+        notes=f"comments_sent={result.comments_sent}",
     )
     return result
 
@@ -217,7 +324,7 @@ def _web_payload(
     row: Mapping[str, Any],
     reviewers: tuple[str, str],
     *,
-    comment_text: str = "",
+    message: str = DEFAULT_DOCFLOW_MESSAGE,
 ) -> dict[str, Any]:
     step_1 = _feedback_code(row.get("step_1_review_status"))
     step_2 = _feedback_code(row.get("step_2_review_status"))
@@ -230,13 +337,13 @@ def _web_payload(
             "Terminate": terminated,
         },
         "terminate_workflow": terminated,
-        # DocFlow has no dedicated comment field; Final Mail text goes in message.
-        "message": _docflow_message(comment_text),
+        # Full Final Mail text is stored via the workflow-comments endpoints.
+        "message": _docflow_message(message),
     }
 
 
 def _docflow_message(comment_text: str) -> str:
-    """Build the external update message, preferring Final Mail comments."""
+    """Build the external update message, truncated to the DocFlow API limit."""
     text = re.sub(r"\s+", " ", (comment_text or "").strip())
     if not text:
         return DEFAULT_DOCFLOW_MESSAGE
@@ -245,13 +352,13 @@ def _docflow_message(comment_text: str) -> str:
     return text[: DOCFLOW_MESSAGE_MAX_LEN - 1].rstrip() + "…"
 
 
-def _comments_by_workflow() -> dict[str, str]:
-    """Aggregate Final Mail review comments by workflow number (newest-ish order)."""
-    comments: dict[str, list[str]] = defaultdict(list)
+def _comment_payloads_by_workflow() -> dict[str, list[dict[str, Any]]]:
+    """Map workflow numbers to ordered DocFlow comment snapshots from SQLite."""
+    comments: dict[str, list[dict[str, Any]]] = defaultdict(list)
     seen: dict[str, set[str]] = defaultdict(set)
     for row in load_workflow_comments():
-        workflow_number = str(row.get("workflow_number") or "")
-        comment = next(
+        workflow_number = str(row.get("workflow_number") or "").strip()
+        body = next(
             (
                 cleaned
                 for value in (row.get("review_comment"), row.get("comment_text"))
@@ -259,14 +366,43 @@ def _comments_by_workflow() -> dict[str, str]:
             ),
             "",
         )
-        if not workflow_number or not comment:
+        if not workflow_number or not body:
             continue
-        key = comment.casefold()
-        if key in seen[workflow_number]:
+        # Prefer mail_id as a stable external identity; fall back to body hash.
+        external_id = str(row.get("mail_id") or "").strip() or None
+        dedupe_key = (external_id or body).casefold()
+        if dedupe_key in seen[workflow_number]:
             continue
-        seen[workflow_number].add(key)
-        comments[workflow_number].append(comment)
-    return {number: "\n".join(values) for number, values in comments.items()}
+        seen[workflow_number].add(dedupe_key)
+
+        author = (
+            str(row.get("from_user") or "").strip()
+            or str(row.get("participant") or "").strip()
+            or None
+        )
+        comments[workflow_number].append(
+            {
+                "external_id": external_id,
+                "author": author,
+                "body": body[:1_000_000],
+                "commented_at": _normalize_commented_at(row.get("sent_date")),
+            }
+        )
+    return dict(comments)
+
+
+def _normalize_commented_at(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    # DocFlow accepts ISO-8601; keep Z / offset forms and plain local timestamps.
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    if parsed.tzinfo is not None:
+        return parsed.isoformat()
+    return parsed.isoformat()
 
 
 def _payload_hash(payload: Mapping[str, Any]) -> str:
@@ -292,3 +428,15 @@ def _api_root(base_url: str) -> str:
 
 def _workflow_url(base_url: str, workflow_number: str) -> str:
     return f"{_api_root(base_url)}/external/workflows/{quote(workflow_number, safe='')}"
+
+
+def _workflow_comments_url(base_url: str, workflow_number: str) -> str:
+    return f"{_workflow_url(base_url, workflow_number)}/comments"
+
+
+def _bulk_comments_url(base_url: str) -> str:
+    return f"{_api_root(base_url)}/external/workflow-comments"
+
+
+def _chunked(values: Sequence[Any], size: int) -> list[Sequence[Any]]:
+    return [values[index : index + size] for index in range(0, len(values), size)]

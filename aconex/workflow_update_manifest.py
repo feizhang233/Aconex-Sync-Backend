@@ -27,26 +27,32 @@ def record_workflow_changes(
     manifest_path: str | Path | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Merge workflow changes into the current ISO-week manifest."""
+    """Merge workflow changes into the current ISO-week manifest.
+
+    Manifest entries are keyed by ``workflow_number`` (business key).
+    ``workflow_id`` is stored only as an auxiliary Aconex reference when present.
+    """
     path = _manifest_path(manifest_path)
     timestamp = _normalized_now(now)
     with _manifest_lock(path):
         manifest, dirty = _load_current_manifest(path, timestamp)
         for raw_change in changes:
-            workflow_id = str(raw_change.get("workflow_id") or "").strip()
             workflow_number = str(raw_change.get("workflow_number") or "").strip()
+            workflow_id = str(raw_change.get("workflow_id") or "").strip()
             kind = str(raw_change.get("kind") or "").strip().casefold()
-            if not workflow_id or not workflow_number:
-                raise ValueError("workflow_id and workflow_number are required")
+            if not workflow_number:
+                raise ValueError("workflow_number is required")
             if kind not in {"new", "status", "comments"}:
                 raise ValueError(f"Unsupported workflow manifest change kind: {kind!r}")
 
             workflows = manifest["workflows"]
-            entry = workflows.get(workflow_id)
+            entry = workflows.get(workflow_number)
             if entry is None:
-                entry = _new_entry(workflow_id, workflow_number, timestamp)
-                workflows[workflow_id] = entry
+                entry = _new_entry(workflow_number, timestamp, workflow_id=workflow_id)
+                workflows[workflow_number] = entry
             entry["workflow_number"] = workflow_number
+            if workflow_id:
+                entry["workflow_id"] = workflow_id
             entry["last_changed_at"] = _iso(timestamp)
             if kind not in entry["change_types"]:
                 entry["change_types"].append(kind)
@@ -99,24 +105,24 @@ def pending_manifest_workflows(
 
 def mark_manifest_sync(
     target: str,
-    workflow_ids: Iterable[str],
+    workflow_numbers: Iterable[str],
     *,
     success: bool,
     error: str | None = None,
     manifest_path: str | Path | None = None,
     now: datetime | None = None,
 ) -> None:
-    """Persist per-target sync success/failure for the supplied workflows."""
+    """Persist per-target sync success/failure for the supplied workflow numbers."""
     _validate_target(target)
-    ids = {str(value).strip() for value in workflow_ids if str(value).strip()}
-    if not ids:
+    numbers = {str(value).strip() for value in workflow_numbers if str(value).strip()}
+    if not numbers:
         return
     path = _manifest_path(manifest_path)
     timestamp = _normalized_now(now)
     with _manifest_lock(path):
         manifest, dirty = _load_current_manifest(path, timestamp)
-        for workflow_id in ids:
-            entry = manifest["workflows"].get(workflow_id)
+        for workflow_number in numbers:
+            entry = manifest["workflows"].get(workflow_number)
             if entry is None:
                 continue
             state = entry["sync"][target]
@@ -154,14 +160,16 @@ def _load_current_manifest(path: Path, now: datetime) -> tuple[dict[str, Any], b
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"Cannot safely read workflow update manifest: {path}") from exc
     _validate_manifest(manifest)
+    rekeyed = _rekey_manifest_entries_to_workflow_number(manifest)
     policy_changed = _apply_docflow_queue_policy(manifest)
+    dirty = rekeyed or policy_changed
     if manifest["week"] == week:
-        return manifest, policy_changed
+        return manifest, dirty
 
     previous_week = str(manifest["week"])
     carried = {
-        workflow_id: entry
-        for workflow_id, entry in manifest["workflows"].items()
+        workflow_number: entry
+        for workflow_number, entry in manifest["workflows"].items()
         if _entry_requires_sync(entry)
     }
     for entry in carried.values():
@@ -169,6 +177,88 @@ def _load_current_manifest(path: Path, now: datetime) -> tuple[dict[str, Any], b
     rolled = _new_manifest(week, now)
     rolled["workflows"] = carried
     return rolled, True
+
+
+def _rekey_manifest_entries_to_workflow_number(manifest: dict[str, Any]) -> bool:
+    """Migrate legacy workflow_id-keyed entries onto workflow_number keys."""
+    workflows = manifest.get("workflows")
+    if not isinstance(workflows, dict) or not workflows:
+        return False
+
+    needs_rekey = any(
+        not isinstance(entry, dict)
+        or str(key) != str(entry.get("workflow_number") or "").strip()
+        for key, entry in workflows.items()
+    )
+    if not needs_rekey:
+        return False
+
+    merged: dict[str, dict[str, Any]] = {}
+    for key, entry in workflows.items():
+        if not isinstance(entry, dict):
+            continue
+        number = str(entry.get("workflow_number") or "").strip() or str(key).strip()
+        if not number:
+            continue
+        entry = deepcopy(entry)
+        entry["workflow_number"] = number
+        if not entry.get("workflow_id"):
+            # Legacy manifests used workflow_id as the map key.
+            legacy_id = str(entry.get("workflow_id") or key).strip()
+            if legacy_id and legacy_id != number:
+                entry["workflow_id"] = legacy_id
+        existing = merged.get(number)
+        if existing is None:
+            merged[number] = entry
+            continue
+        merged[number] = _merge_manifest_entries(existing, entry)
+
+    manifest["workflows"] = merged
+    return True
+
+
+def _merge_manifest_entries(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    """Combine two manifest entries for the same workflow_number."""
+    combined = deepcopy(left)
+    if right.get("workflow_id") and (
+        not combined.get("workflow_id")
+        or str(right["workflow_id"]) < str(combined.get("workflow_id") or "")
+    ):
+        combined["workflow_id"] = right["workflow_id"]
+    for kind in right.get("change_types") or []:
+        if kind not in combined["change_types"]:
+            combined["change_types"].append(kind)
+    if str(right.get("first_changed_at") or "") < str(combined.get("first_changed_at") or ""):
+        combined["first_changed_at"] = right.get("first_changed_at")
+    if str(right.get("last_changed_at") or "") > str(combined.get("last_changed_at") or ""):
+        combined["last_changed_at"] = right.get("last_changed_at")
+    for event in right.get("events") or []:
+        if not _event_exists(combined["events"], event):
+            combined["events"].append(deepcopy(event))
+    for target in SYNC_TARGETS:
+        combined["sync"][target] = _merge_sync_state(
+            combined["sync"][target],
+            (right.get("sync") or {}).get(target) or _sync_state("not_required"),
+        )
+    if right.get("carried_from_week") and not combined.get("carried_from_week"):
+        combined["carried_from_week"] = right.get("carried_from_week")
+    return combined
+
+
+def _merge_sync_state(left: Mapping[str, Any], right: Mapping[str, Any]) -> dict[str, Any]:
+    priority = {"failed": 3, "pending": 2, "synced": 1, "not_required": 0}
+    left_status = str(left.get("status") or "not_required")
+    right_status = str(right.get("status") or "not_required")
+    if priority.get(right_status, 0) > priority.get(left_status, 0):
+        winner = dict(right)
+    else:
+        winner = dict(left)
+    return {
+        "status": winner.get("status") or "not_required",
+        "synced_at": winner.get("synced_at"),
+        "last_attempt_at": winner.get("last_attempt_at"),
+        "last_error": winner.get("last_error"),
+    }
 
 
 def _new_manifest(week: str, now: datetime) -> dict[str, Any]:
@@ -182,10 +272,14 @@ def _new_manifest(week: str, now: datetime) -> dict[str, Any]:
     }
 
 
-def _new_entry(workflow_id: str, workflow_number: str, now: datetime) -> dict[str, Any]:
+def _new_entry(
+    workflow_number: str,
+    now: datetime,
+    *,
+    workflow_id: str = "",
+) -> dict[str, Any]:
     timestamp = _iso(now)
-    return {
-        "workflow_id": workflow_id,
+    entry = {
         "workflow_number": workflow_number,
         "change_types": [],
         "first_changed_at": timestamp,
@@ -196,6 +290,9 @@ def _new_entry(workflow_id: str, workflow_number: str, now: datetime) -> dict[st
             "docflow": _sync_state("not_required"),
         },
     }
+    if workflow_id:
+        entry["workflow_id"] = workflow_id
+    return entry
 
 
 def _sync_state(status: str) -> dict[str, Any]:
@@ -255,12 +352,13 @@ def _validate_manifest(manifest: Any) -> None:
         )
     if not isinstance(manifest.get("week"), str) or not isinstance(manifest.get("workflows"), dict):
         raise RuntimeError("Workflow update manifest is missing week/workflows fields")
-    for workflow_id, entry in manifest["workflows"].items():
-        if not isinstance(entry, dict) or str(entry.get("workflow_id") or "") != str(workflow_id):
-            raise RuntimeError(f"Invalid workflow update manifest entry: {workflow_id!r}")
+    for key, entry in manifest["workflows"].items():
+        if not isinstance(entry, dict):
+            raise RuntimeError(f"Invalid workflow update manifest entry: {key!r}")
+        # Allow legacy keys temporarily; rekey step normalizes to workflow_number.
         sync = entry.get("sync")
         if not isinstance(sync, dict) or any(target not in sync for target in SYNC_TARGETS):
-            raise RuntimeError(f"Workflow update manifest entry has invalid sync state: {workflow_id!r}")
+            raise RuntimeError(f"Workflow update manifest entry has invalid sync state: {key!r}")
 
 
 @contextmanager

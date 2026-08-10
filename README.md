@@ -69,6 +69,7 @@ python main.py workflow-db-sync-all
 python main.py workflow-db-sync-changed
 python main.py docflow-workflow-push-all
 python main.py docflow-workflow-push-changed
+python main.py docflow-comments-push-all
 python main.py export-workflow-status --from-number 800
 ```
 
@@ -81,8 +82,21 @@ ISO-week manifest at `data/state/workflow_update_manifest.json`.
 sync is pending/failed; a `404 Workflow not found` is a normal skipped result
 and is not retried unless the workflow status or Final Mail comments change.
 Newly discovered Aconex workflows are not queued for DocFlow; only later
-**status** or **comments** changes are eligible. DocFlow's external API has no
-dedicated comment field, so Final Mail text is sent in `message` (max 500 chars).
+**status** or **comments** changes are eligible.
+
+Workflow status is sent with
+`PATCH /api/external/workflows/{workflow_number}`. Complete Final Mail comments
+from SQLite `workflow_comments` are imported with:
+
+- per-workflow `PUT /api/external/workflows/{workflow_number}/comments` during
+  status push
+- bulk `PUT /api/external/workflow-comments` via `docflow-comments-push-all`
+  for a one-shot import of the entire SQLite comment table
+
+Comments are stored in DocFlow by **workflow number only** (not document or
+package name). Every package that uses a workflow number reads the same shared
+comment snapshot in the document drawer. `docflow-comments-push-all` imports the
+full SQLite `workflow_comments` table even when no DocFlow package exists yet.
 All DocFlow requests include the Cloudflare Access Service Token headers when
 `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` are configured.
 
@@ -196,4 +210,7 @@ Raw responses → `data/raw/`; Excel → `data/output/`; DB/manifest → `data/s
 - Cron uses the **server local timezone**. Use `Europe/Belgrade` so weekday 10:00 is Belgrade time.
 - Keep the VPS user session able to write `.env` (token rotation) and `data/state/`.
 - Do not commit `.env`, `google_service_account.json`, or `data/`.
+- Local SQLite and the weekly update manifest use **`workflow_number` as the business key**.
+  Aconex still exposes a separate `WorkflowId` per step (and per document); that value is kept only
+  as an auxiliary reference and is not unique per business workflow.
 - More detail: [docs/README.md](docs/README.md).

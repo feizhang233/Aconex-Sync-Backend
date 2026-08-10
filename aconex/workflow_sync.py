@@ -196,17 +196,21 @@ def workflow_sync_reviewing(
         max_pages=max_pages,
         save_raw=save_raw,
     )
-    rows_by_id = {
-        str(row.get("workflow_id") or row.get("workflow_number")): row
+    # Business key is workflow_number. Open-search rows overwrite current-list
+    # rows for the same number so local pending workflows get the richest status.
+    rows_by_number: dict[str, Mapping[str, Any]] = {
+        str(row.get("workflow_number") or ""): row
         for row in current_rows
+        if row.get("workflow_number")
     }
-    rows_by_id.update(
+    rows_by_number.update(
         {
-            str(row.get("workflow_id") or row.get("workflow_number")): row
+            str(row.get("workflow_number") or ""): row
             for row in open_rows
+            if row.get("workflow_number")
         }
     )
-    rows = list(rows_by_id.values())
+    rows = list(rows_by_number.values())
     output_path = output or settings.output_dir / "workflow_status_reviewing.xlsx"
     return _sync_rows(
         settings,
@@ -245,21 +249,25 @@ def _sync_rows(
     checked_override: int | None = None,
 ) -> Path:
     checked_at = _utc_now()
-    old_by_id = {row["workflow_id"]: row for row in load_workflows() if row.get("workflow_id")}
+    old_by_number = {
+        str(row["workflow_number"]): row
+        for row in load_workflows()
+        if row.get("workflow_number")
+    }
     changed_count = 0
     failed_count = 0
-    synced_ids: list[str] = []
+    synced_numbers: list[str] = []
     manifest_changes: list[dict[str, Any]] = []
 
     for raw_row in rows:
         try:
             row = _db_row(raw_row, checked_at=checked_at, source=source)
-            old_row = old_by_id.get(row["workflow_id"])
+            old_row = old_by_number.get(row["workflow_number"])
             status_changed = _status_changed(old_row, row)
             if status_changed:
                 change_summary = _change_summary(old_row, row)
                 add_workflow_history(
-                    row["workflow_id"],
+                    workflow_id=row.get("workflow_id") or None,
                     workflow_number=row["workflow_number"],
                     checked_at=checked_at,
                     change_summary=change_summary,
@@ -271,7 +279,7 @@ def _sync_rows(
             if status_changed:
                 manifest_changes.append(
                     {
-                        "workflow_id": row["workflow_id"],
+                        "workflow_id": row.get("workflow_id") or "",
                         "workflow_number": row["workflow_number"],
                         "kind": "new" if old_row is None else "status",
                         "changed_at": checked_at,
@@ -280,7 +288,7 @@ def _sync_rows(
                         "new": _history_payload(row),
                     }
                 )
-            synced_ids.append(row["workflow_id"])
+            synced_numbers.append(row["workflow_number"])
         except Exception as exc:
             failed_count += 1
             print(f"Failed to sync workflow row {raw_row.get('workflow_number') or '<unknown>'}: {exc}")
@@ -299,7 +307,7 @@ def _sync_rows(
 
     latest_rows = [
         row for row in load_workflows()
-        if row.get("workflow_id") in set(synced_ids)
+        if row.get("workflow_number") in set(synced_numbers)
     ]
     _write_workflow_status_excel(latest_rows, output)
     print(
@@ -311,9 +319,9 @@ def _sync_rows(
 
 def _db_row(row: Mapping[str, Any], *, checked_at: str, source: str) -> dict[str, Any]:
     workflow_number = str(row.get("workflow_number") or "").strip()
-    workflow_id = str(row.get("workflow_id") or "").strip() or workflow_number
-    if not workflow_id:
-        raise ValueError("workflow_id or workflow_number is required")
+    if not workflow_number:
+        raise ValueError("workflow_number is required")
+    workflow_id = str(row.get("workflow_id") or "").strip() or None
 
     return {
         "workflow_id": workflow_id,

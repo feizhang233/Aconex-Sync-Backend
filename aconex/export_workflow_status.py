@@ -439,6 +439,17 @@ def _workflow_step(workflow: etree._Element) -> WorkflowStep | None:
     )
 
 
+def _canonical_workflow_id(steps: list[WorkflowStep]) -> str:
+    """Pick a stable auxiliary Aconex id for a business workflow number.
+
+    Aconex assigns a distinct WorkflowId per step (and per document). The business
+    key is WorkflowNumber; we keep the lexicographically smallest non-empty id as
+    a deterministic reference only.
+    """
+    ids = sorted({step.workflow_id for step in steps if step.workflow_id})
+    return ids[0] if ids else ""
+
+
 def _status_row(workflow_number: str, steps: list[WorkflowStep]) -> dict[str, str]:
     selected = _select_steps(steps)
     step_1 = selected.get(1)
@@ -448,7 +459,7 @@ def _status_row(workflow_number: str, steps: list[WorkflowStep]) -> dict[str, st
         None,
     )
     return {
-        "workflow_id": _first_non_empty(step.workflow_id for step in steps),
+        "workflow_id": _canonical_workflow_id(steps),
         "workflow_number": workflow_number,
         "workflow_number_int": str(_workflow_number_value(workflow_number) or ""),
         "workflow_title": _first_non_empty(step.workflow_title for step in steps),

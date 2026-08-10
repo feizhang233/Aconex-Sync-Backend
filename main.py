@@ -23,7 +23,10 @@ from aconex.mail_final_scan import mail_scan_final_all, mail_scan_final_from, ma
 from aconex.state_db import DEFAULT_DB_PATH, init_db
 from aconex.utils import update_env_tokens
 from aconex.workflow_sync import workflow_sync_all, workflow_sync_from, workflow_sync_reviewing, workflow_update_open
-from aconex.web_workflow_sync import push_workflows_to_docflow
+from aconex.web_workflow_sync import (
+    push_workflow_comments_to_docflow,
+    push_workflows_to_docflow,
+)
 from postprocess.normalize_mail import normalize_mail
 from postprocess.normalize_workflow import normalize_workflow
 
@@ -182,12 +185,34 @@ def main() -> None:
         db_sync_parser.add_argument("--save-raw", action="store_true")
 
     for command, help_text in (
-        ("docflow-workflow-push-all", "Push every locally stored workflow status to DocFlow."),
-        ("docflow-workflow-push-changed", "Push only locally changed workflow statuses to DocFlow."),
+        (
+            "docflow-workflow-push-all",
+            "Push every locally stored workflow status and Final Mail comments to DocFlow.",
+        ),
+        (
+            "docflow-workflow-push-changed",
+            "Push only locally changed workflow statuses and Final Mail comments to DocFlow.",
+        ),
     ):
         docflow_push_parser = sub.add_parser(command, help=help_text)
         docflow_push_parser.add_argument("--web-base-url")
         docflow_push_parser.add_argument("--api-key")
+
+    docflow_comments_parser = sub.add_parser(
+        "docflow-comments-push-all",
+        help=(
+            "Import every Final Mail comment snapshot from local SQLite into DocFlow "
+            "via PUT /api/external/workflow-comments."
+        ),
+    )
+    docflow_comments_parser.add_argument("--web-base-url")
+    docflow_comments_parser.add_argument("--api-key")
+    docflow_comments_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=100,
+        help="Workflows per bulk import request (default: 100).",
+    )
 
     google_sheet_all_parser = sub.add_parser("google-sheet-sync-all")
     google_sheet_all_parser.add_argument("--spreadsheet-id", required=True)
@@ -406,7 +431,24 @@ def main() -> None:
             raise SystemExit(f"DocFlow workflow sync failed: {exc}") from exc
         print(
             f"DocFlow workflow push complete: checked={result.checked}, "
-            f"sent={result.sent}, skipped={result.skipped}, failed={result.failed}"
+            f"sent={result.sent}, skipped={result.skipped}, failed={result.failed}, "
+            f"comments_sent={result.comments_sent}, "
+            f"comments_skipped={result.comments_skipped}"
+        )
+    elif args.command == "docflow-comments-push-all":
+        try:
+            result = push_workflow_comments_to_docflow(
+                settings,
+                base_url=args.web_base_url,
+                api_key=args.api_key,
+                batch_size=args.batch_size,
+            )
+        except (requests.RequestException, ValueError) as exc:
+            raise SystemExit(f"DocFlow comments import failed: {exc}") from exc
+        print(
+            f"DocFlow comments import complete: checked={result.checked}, "
+            f"comments_sent={result.comments_sent}, "
+            f"comments_skipped={result.comments_skipped}, failed={result.failed}"
         )
     elif args.command == "google-sheet-sync-all":
         try:
@@ -500,7 +542,9 @@ def main() -> None:
         print(
             f"DB → DocFlow complete: checked={docflow_result.checked}, "
             f"sent={docflow_result.sent}, skipped={docflow_result.skipped}, "
-            f"failed={docflow_result.failed}"
+            f"failed={docflow_result.failed}, "
+            f"comments_sent={docflow_result.comments_sent}, "
+            f"comments_skipped={docflow_result.comments_skipped}"
         )
     elif args.command == "mail-scan-final-all":
         try:
