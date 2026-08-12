@@ -136,11 +136,32 @@ def push_workflows_to_docflow(
                     timeout=30,
                 )
                 if response.status_code == 404:
+                    # Package missing in DocFlow: never record a success hash, or later
+                    # changed-only runs will skip forever while the UI stays stale.
                     skipped += 1
                     print(f"Skipped workflow status not present in DocFlow: {workflow_number}")
-                else:
-                    response.raise_for_status()
-                    sent += 1
+                    should_push_comments = (not changed_only) or bool(comments) or (
+                        "comments" in change_types
+                    )
+                    if should_push_comments and comments:
+                        comment_response = session.put(
+                            _workflow_comments_url(url, workflow_number),
+                            json={"comments": comments},
+                            timeout=60,
+                        )
+                        comment_response.raise_for_status()
+                        comments_sent += 1
+                    if workflow_number in pending_numbers:
+                        mark_manifest_sync(
+                            "docflow",
+                            [workflow_number],
+                            success=False,
+                            error="Workflow not present in DocFlow",
+                        )
+                    continue
+
+                response.raise_for_status()
+                sent += 1
 
                 # Comments are keyed by workflow number only and do not require a package.
                 should_push_comments = (not changed_only) or bool(comments) or (
@@ -155,6 +176,8 @@ def push_workflows_to_docflow(
                     comment_response.raise_for_status()
                     comments_sent += 1
 
+                # Only persist the hash after a successful status write so a later
+                # remote overwrite / missed apply can be retried.
                 upsert_docflow_sync_state(workflow_number, payload_hash)
                 if workflow_number in pending_numbers:
                     mark_manifest_sync("docflow", [workflow_number], success=True)

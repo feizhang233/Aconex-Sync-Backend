@@ -682,6 +682,32 @@ def upsert_docflow_sync_state(
         )
 
 
+def delete_docflow_sync_state(
+    workflow_numbers: list[str] | set[str] | tuple[str, ...] | None = None,
+    *,
+    db_path: str | Path | None = None,
+) -> int:
+    """Drop stored DocFlow payload hashes so the next push re-applies status.
+
+    When ``workflow_numbers`` is None/empty, clears the entire sync table.
+    Returns the number of deleted rows.
+    """
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        if not workflow_numbers:
+            cur = conn.execute("DELETE FROM docflow_workflow_sync")
+            return int(cur.rowcount or 0)
+        numbers = sorted({str(value).strip() for value in workflow_numbers if str(value).strip()})
+        if not numbers:
+            return 0
+        placeholders = ", ".join("?" for _ in numbers)
+        cur = conn.execute(
+            f"DELETE FROM docflow_workflow_sync WHERE workflow_number IN ({placeholders})",
+            numbers,
+        )
+        return int(cur.rowcount or 0)
+
+
 def load_workflow_comments(db_path: str | Path | None = None) -> list[dict[str, Any]]:
     init_db(db_path)
     with _connect(db_path) as conn:

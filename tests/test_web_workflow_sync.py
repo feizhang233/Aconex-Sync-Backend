@@ -282,6 +282,61 @@ class WebWorkflowSyncTests(unittest.TestCase):
         upsert_hash.assert_called_once()
 
     @patch("aconex.web_workflow_sync.add_update_run")
+    @patch("aconex.web_workflow_sync.upsert_docflow_sync_state")
+    @patch("aconex.web_workflow_sync.mark_manifest_sync")
+    @patch("aconex.web_workflow_sync.load_workflow_comments", return_value=[])
+    @patch("aconex.web_workflow_sync.load_docflow_sync_state", return_value={})
+    @patch("aconex.web_workflow_sync._load_feedback_reviewers", return_value=("UTIBER", "GDS"))
+    @patch("aconex.web_workflow_sync.load_workflows")
+    @patch("aconex.web_workflow_sync.pending_manifest_workflows")
+    @patch("aconex.web_workflow_sync.requests.Session")
+    def test_push_does_not_store_hash_when_docflow_package_missing(
+        self,
+        session_cls,
+        pending_manifest,
+        load_workflows,
+        _load_reviewers,
+        _load_hashes,
+        _load_comments,
+        mark_sync,
+        upsert_hash,
+        _add_run,
+    ):
+        settings = SimpleNamespace(
+            docflow_base_url="https://docflow.example",
+            docflow_api_key="key",
+            cf_access_client_id="",
+            cf_access_client_secret="",
+        )
+        pending_manifest.return_value = [
+            {"workflow_id": "1", "workflow_number": "WF-000404", "change_types": ["status"]}
+        ]
+        load_workflows.return_value = [
+            {
+                "workflow_id": "1",
+                "workflow_number": "WF-000404",
+                "step_1_review_status": "C-Reject",
+                "step_2_review_status": "C-Reject",
+                "review_status": "C-Reject",
+            }
+        ]
+        session = MagicMock()
+        session_cls.return_value.__enter__.return_value = session
+        session.patch.return_value = MagicMock(status_code=404)
+
+        result = push_workflows_to_docflow(settings, changed_only=True)
+
+        self.assertEqual(result.skipped, 1)
+        self.assertEqual(result.sent, 0)
+        upsert_hash.assert_not_called()
+        mark_sync.assert_called_with(
+            "docflow",
+            ["WF-000404"],
+            success=False,
+            error="Workflow not present in DocFlow",
+        )
+
+    @patch("aconex.web_workflow_sync.add_update_run")
     @patch("aconex.web_workflow_sync.load_workflow_comments")
     @patch("aconex.web_workflow_sync.requests.Session")
     def test_bulk_comment_import_uses_docflow_endpoint(
