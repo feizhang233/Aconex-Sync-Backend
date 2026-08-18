@@ -20,6 +20,7 @@ from aconex.google_sheets import (
     sync_google_sheet_reviewing_with_comments,
 )
 from aconex.mail_final_scan import mail_scan_final_all, mail_scan_final_from, mail_scan_final_recent
+from aconex.pipeline import run_daily_update
 from aconex.state_db import DEFAULT_DB_PATH, init_db
 from aconex.utils import update_env_tokens
 from aconex.workflow_sync import workflow_sync_all, workflow_sync_from, workflow_sync_reviewing, workflow_update_open
@@ -511,7 +512,7 @@ def main() -> None:
         # 2) Triggered Final Mail comments → SQLite + manifest
         # 3) Unsynced manifest entries → Google Sheets and DocFlow
         try:
-            sheet_result = sync_google_sheet_reviewing_with_comments(
+            result = run_daily_update(
                 settings,
                 client,
                 spreadsheet_id=args.spreadsheet_id,
@@ -520,31 +521,26 @@ def main() -> None:
                 max_pages=args.max_pages,
                 mail_max_pages=args.mail_max_pages,
                 save_raw=args.save_raw,
+                web_base_url=args.web_base_url,
+                api_key=args.api_key,
             )
         except requests.HTTPError as exc:
             raise SystemExit(clean_api_error(exc)) from exc
         except RuntimeError as exc:
             raise SystemExit(f"Daily workflow update failed: {exc}") from exc
-        print(
-            f"Aconex → DB → Google Sheet complete: rows_written={sheet_result.rows_written}, "
-            f"changed_workflows={sheet_result.changed_workflows}, "
-            f"new_workflows={sheet_result.new_workflows}"
-        )
-        try:
-            docflow_result = push_workflows_to_docflow(
-                settings,
-                changed_only=True,
-                base_url=args.web_base_url,
-                api_key=args.api_key,
-            )
         except (requests.RequestException, ValueError) as exc:
-            raise SystemExit(f"DocFlow workflow sync failed: {exc}") from exc
+            raise SystemExit(f"Daily update failed: {exc}") from exc
         print(
-            f"DB → DocFlow complete: checked={docflow_result.checked}, "
-            f"sent={docflow_result.sent}, skipped={docflow_result.skipped}, "
-            f"failed={docflow_result.failed}, "
-            f"comments_sent={docflow_result.comments_sent}, "
-            f"comments_skipped={docflow_result.comments_skipped}"
+            f"Aconex → DB → Google Sheet complete: rows_written={result.sheet.rows_written}, "
+            f"changed_workflows={result.sheet.changed_workflows}, "
+            f"new_workflows={result.sheet.new_workflows}"
+        )
+        print(
+            f"DB → DocFlow complete: checked={result.docflow.checked}, "
+            f"sent={result.docflow.sent}, skipped={result.docflow.skipped}, "
+            f"failed={result.docflow.failed}, "
+            f"comments_sent={result.docflow.comments_sent}, "
+            f"comments_skipped={result.docflow.comments_skipped}"
         )
     elif args.command == "mail-scan-final-all":
         try:

@@ -4,6 +4,17 @@ Automates Aconex **mail** and **workflow** pulls via official APIs, keeps local 
 
 Designed to run unattended on an **Ubuntu VPS** (cron, weekdays 10:00).
 
+## Isolated refactor checkout
+
+The live weekday job still runs from `/home/fei/Work/Aconex` on `main`. This
+directory is a separate git worktree on `refactor/workflow-state`. It has its
+own `data/` and does **not** share the production SQLite file, weekly
+manifest, `.env`, or service-account JSON.
+
+Do not point this tree at the production database. To try a command here,
+copy `.env` and credentials into this folder first; local state will still
+be written only under this worktree's `data/`.
+
 ## Setup (Ubuntu VPS)
 
 ```bash
@@ -75,14 +86,18 @@ python main.py export-workflow-status --from-number 800
 
 The DocFlow commands read only local SQLite/manifest state; they never contact
 Aconex. `workflow-db-sync-all` imports all Aconex workflows. For regular
-updates, use `workflow-db-sync-changed`, which refreshes current workflows and
-locally reviewing/pending workflows. These changes are merged into the current
-ISO-week manifest at `data/state/workflow_update_manifest.json`.
+updates, use `workflow-db-sync-changed`, which refreshes current workflows,
+locally reviewing/pending workflows, and any workflow numbers missing from
+SQLite in the known range (plus a short lookahead). That last step catches
+workflows that are created and completed between two daily runs. These changes
+are merged into the current ISO-week manifest at
+`data/state/workflow_update_manifest.json`.
 `docflow-workflow-push-changed` publishes only manifest entries whose DocFlow
 sync is pending/failed; a `404 Workflow not found` is a normal skipped result
 and is not retried unless the workflow status or Final Mail comments change.
-Newly discovered Aconex workflows are not queued for DocFlow; only later
-**status** or **comments** changes are eligible.
+Newly discovered **pending** Aconex workflows are not queued for DocFlow.
+First-seen workflows that already have a final review status (A/B/C or
+terminated), and later **status** or **comments** changes, are eligible.
 
 Workflow status is sent with
 `PATCH /api/external/workflows/{workflow_number}`. Complete Final Mail comments
@@ -128,7 +143,7 @@ manifest; Google Sheets updates only manifest entries not yet synchronized.
 
 `daily-update` is the end-to-end job for unattended runs:
 
-1. Pull new and reviewing/pending Aconex workflows into SQLite and the weekly manifest
+1. Pull new, reviewing/pending, and previously missed Aconex workflows into SQLite and the weekly manifest
 2. For qualifying Step 2 transitions (and recent finals missing comments), pull Final-mail comments
 3. Update only unsynchronized manifest entries in Google Sheets (status + comments)
 4. Push only unsynchronized manifest entries to DocFlow (status + Final Mail in `message`; GDS is always Step 2)
@@ -197,6 +212,10 @@ Raw responses → `data/raw/`; Excel → `data/output/`; DB/manifest → `data/s
 | Path | Purpose |
 | --- | --- |
 | `main.py` | CLI entry |
+| `aconex/workflow.py` | Workflow-number identity and status rules |
+| `aconex/db/` | SQLite schema version, one-shot migrations, repositories |
+| `aconex/state_db.py` | Compatibility facade over `aconex.db` |
+| `aconex/pipeline.py` | Daily-update sequencing |
 | `aconex/` | Auth, API client, sync, exports |
 | `postprocess/` | Offline normalize (no API calls) |
 | `data/` | Generated raw/parsed/output/state (gitignored) |

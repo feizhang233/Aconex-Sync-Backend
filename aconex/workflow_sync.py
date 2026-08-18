@@ -23,6 +23,17 @@ from .state_db import (
     upsert_workflow,
 )
 from .utils import display_date
+from .workflow import (
+    KEY_STATUS_COLUMNS,
+    format_missing_workflow_numbers,
+    format_workflow_number,
+    has_pushable_review_status,
+    is_workflow_completed,
+    missing_workflow_numbers,
+    parse_workflow_number_int,
+    workflow_number_ints,
+    workflow_number_width,
+)
 from .workflow_update_manifest import record_workflow_changes
 
 
@@ -60,24 +71,19 @@ WORKFLOW_OUTPUT_COLUMNS = [
     "step_2_overdue_duration_or_status",
 ]
 
-KEY_STATUS_COLUMNS = [
-    "workflow_number",
-    "workflow_number_int",
-    "workflow_title",
-    "review_outcome",
-    "review_status",
-    "step_1_completed_time",
-    "step_1_due_time",
-    "step_1_review_status",
-    "step_1_overdue_duration_or_status",
-    "step_2_completed_time",
-    "step_2_due_time",
-    "step_2_review_status",
-    "step_2_overdue_duration_or_status",
-    "is_completed",
+# Re-exported for tests and older callers.
+__all__ = [
+    "format_missing_workflow_numbers",
+    "format_workflow_number",
+    "has_pushable_review_status",
+    "is_workflow_completed",
+    "missing_workflow_numbers",
+    "workflow_number_width",
+    "workflow_sync_all",
+    "workflow_sync_from",
+    "workflow_sync_reviewing",
+    "workflow_update_open",
 ]
-
-COMPLETED_STATUS_MARKERS = ("completed", "closed", "terminate", "terminated")
 
 
 def workflow_sync_all(
@@ -171,13 +177,19 @@ def workflow_sync_reviewing(
     output: Path | None = None,
     save_raw: bool = False,
 ) -> Path:
-    """Sync new and existing workflows that are still under review.
+    """Sync reviewing workflows and any numbers the current-only pull can miss.
 
     The current-workflows endpoint discovers unrecorded pending workflows. Existing
     rows marked open in SQLite are also refreshed by workflow number, so a workflow
     that has just completed or terminated is closed out without reprocessing the
     already-complete database history.
+
+    Workflows that are created and completed between two daily runs never appear
+    in the current list and are absent from SQLite, so they would otherwise be
+    skipped forever. Those holes (plus a short lookahead past the highest known
+    number) are fetched by workflow number.
     """
+    stored_rows = load_workflows()
     current_rows = fetch_current_workflow_status_rows(
         settings,
         client,
@@ -189,15 +201,36 @@ def workflow_sync_reviewing(
         for row in get_pending_workflows()
         if row.get("workflow_number")
     ]
-    open_rows = fetch_workflow_status_rows_by_numbers(
+    already_numbered = {
+        str(row.get("workflow_number") or "")
+        for row in current_rows
+        if row.get("workflow_number")
+    }
+    already_numbered.update(open_numbers)
+    gap_numbers = [
+        number
+        for number in format_missing_workflow_numbers(
+            known=workflow_number_ints(stored_rows),
+            extra_high_water=workflow_number_ints(current_rows),
+            width=workflow_number_width(list(stored_rows) + list(current_rows)),
+        )
+        if number not in already_numbered
+    ]
+    numbered_rows = fetch_workflow_status_rows_by_numbers(
         settings,
         client,
-        workflow_numbers=open_numbers,
+        workflow_numbers=open_numbers + gap_numbers,
         max_pages=max_pages,
         save_raw=save_raw,
     )
-    # Business key is workflow_number. Open-search rows overwrite current-list
-    # rows for the same number so local pending workflows get the richest status.
+    if gap_numbers:
+        print(
+            f"Reviewing sync also searched {len(gap_numbers)} missing/lookahead "
+            f"workflow numbers"
+        )
+    # Business key is workflow_number. Numbered-search rows overwrite current-list
+    # rows for the same number so local pending and gap-filled workflows get the
+    # richest status.
     rows_by_number: dict[str, Mapping[str, Any]] = {
         str(row.get("workflow_number") or ""): row
         for row in current_rows
@@ -206,7 +239,7 @@ def workflow_sync_reviewing(
     rows_by_number.update(
         {
             str(row.get("workflow_number") or ""): row
-            for row in open_rows
+            for row in numbered_rows
             if row.get("workflow_number")
         }
     )
@@ -220,23 +253,6 @@ def workflow_sync_reviewing(
         source="workflow-sync-reviewing",
         checked_override=len(rows),
     )
-
-
-def is_workflow_completed(row: Mapping[str, Any]) -> bool:
-    step_1_completed = bool(str(row.get("step_1_completed_time") or "").strip())
-    step_2_completed = bool(str(row.get("step_2_completed_time") or "").strip())
-    if step_1_completed and step_2_completed:
-        return True
-
-    status_text = " ".join(
-        str(row.get(key) or "")
-        for key in (
-            "workflow_status",
-            "step_status",
-            "review_status",
-        )
-    ).lower()
-    return any(marker in status_text for marker in COMPLETED_STATUS_MARKERS)
 
 
 def _sync_rows(
@@ -277,16 +293,13 @@ def _sync_rows(
                 changed_count += 1
             upsert_workflow(row)
             if status_changed:
-                manifest_changes.append(
-                    {
-                        "workflow_id": row.get("workflow_id") or "",
-                        "workflow_number": row["workflow_number"],
-                        "kind": "new" if old_row is None else "status",
-                        "changed_at": checked_at,
-                        "summary": change_summary,
-                        "old": _history_payload(old_row) if old_row else None,
-                        "new": _history_payload(row),
-                    }
+                manifest_changes.extend(
+                    _manifest_changes_for_row(
+                        old_row,
+                        row,
+                        checked_at=checked_at,
+                        summary=change_summary,
+                    )
                 )
             synced_numbers.append(row["workflow_number"])
         except Exception as exc:
@@ -326,7 +339,7 @@ def _db_row(row: Mapping[str, Any], *, checked_at: str, source: str) -> dict[str
     return {
         "workflow_id": workflow_id,
         "workflow_number": workflow_number,
-        "workflow_number_int": _int_or_none(row.get("workflow_number_int")),
+        "workflow_number_int": parse_workflow_number_int(row.get("workflow_number_int")),
         "workflow_title": row.get("workflow_title") or "",
         "review_outcome": row.get("review_outcome") or "",
         "review_status": row.get("review_status") or "",
@@ -343,6 +356,35 @@ def _db_row(row: Mapping[str, Any], *, checked_at: str, source: str) -> dict[str
         "last_changed_at": None,
         "source": source,
     }
+
+
+def _manifest_changes_for_row(
+    old_row: Mapping[str, Any] | None,
+    row: Mapping[str, Any],
+    *,
+    checked_at: str,
+    summary: str,
+) -> list[dict[str, Any]]:
+    """Build weekly-manifest events for a changed workflow row.
+
+    First-seen pending workflows stay ``new`` only, so DocFlow is not polled
+    before a package exists. First-seen rows that already have a final review
+    status also emit ``status`` so DocFlow applies the completed result.
+    """
+    payload = {
+        "workflow_id": row.get("workflow_id") or "",
+        "workflow_number": row["workflow_number"],
+        "changed_at": checked_at,
+        "summary": summary,
+        "old": _history_payload(old_row) if old_row else None,
+        "new": _history_payload(row),
+    }
+    if old_row is not None:
+        return [{**payload, "kind": "status"}]
+    changes = [{**payload, "kind": "new"}]
+    if has_pushable_review_status(row):
+        changes.append({**payload, "kind": "status"})
+    return changes
 
 
 def _status_changed(old_row: Mapping[str, Any] | None, new_row: Mapping[str, Any]) -> bool:
@@ -385,15 +427,6 @@ def _write_workflow_status_excel(rows: Iterable[Mapping[str, Any]], output: Path
         frame.to_excel(writer, sheet_name="Workflow Status", index=False)
     format_workflow_status_workbook(output)
     print(f"Wrote workflow status report: {output}")
-
-
-def _int_or_none(value: Any) -> int | None:
-    if value in (None, ""):
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def _utc_now() -> str:
