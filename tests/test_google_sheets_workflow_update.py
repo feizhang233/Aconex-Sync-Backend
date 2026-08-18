@@ -36,18 +36,24 @@ class GoogleSheetsWorkflowUpdateTests(unittest.TestCase):
                 "step_2_review_status": "B-Approved with comments",
                 "review_status": "B-Approved with comments",
             },
+            {
+                "workflow_id": "4",
+                "workflow_number": "WF-000004",
+                "step_2_review_status": "B-Approved with comments",
+                "review_status": "B-Approved with comments",
+            },
         ]
         self.assertEqual(
             _step_2_pending_to_final_numbers(
                 _workflow_snapshots(before_rows),
                 after_rows,
-                {"WF-000001", "WF-000002", "WF-000003"},
+                {"WF-000001", "WF-000002", "WF-000003", "WF-000004"},
             ),
-            {"WF-000001"},
+            {"WF-000001", "WF-000004"},
         )
 
-    @patch("aconex.google_sheets.pending_manifest_workflows")
-    @patch("aconex.google_sheets.load_workflows")
+    @patch("aconex.mail_triggers.pending_manifest_workflows")
+    @patch("aconex.mail_triggers.load_workflows")
     def test_pending_manifest_recovers_mail_trigger_after_failed_run(
         self, load_workflows, pending_manifest
     ):
@@ -69,8 +75,8 @@ class GoogleSheetsWorkflowUpdateTests(unittest.TestCase):
         ]
         self.assertEqual(_pending_manifest_step_2_final_numbers(), {"WF-000010"})
 
-    @patch("aconex.google_sheets.load_workflow_comments")
-    @patch("aconex.google_sheets.load_workflows")
+    @patch("aconex.mail_triggers.load_workflow_comments")
+    @patch("aconex.mail_triggers.load_workflows")
     def test_missing_comment_recovery_includes_recent_step_2_finals(
         self, load_workflows, load_comments
     ):

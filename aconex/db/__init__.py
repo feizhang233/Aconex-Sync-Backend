@@ -1,32 +1,25 @@
-"""Compatibility facade for the state database.
-
-The implementation lives in ``aconex.db``. New code should import from there.
-This module keeps the previous public names so existing callers and tests work.
-"""
-
-from aconex.db import (
-    DEFAULT_DB_PATH,
+from .connection import DEFAULT_DB_PATH, connect, init_db, resolve_db_path
+from .repositories import (
+    add_update_run,
+    add_workflow_history,
+    dedupe_workflows,
+    delete_docflow_sync_state,
+    get_open_workflows,
+    get_pending_workflows,
+    load_docflow_sync_state,
+    load_update_runs,
+    load_workflow_comments,
+    load_workflows,
+    upsert_docflow_sync_state,
+    upsert_workflow,
+    upsert_workflow_comment,
+)
+from .schema import (
     DOCFLOW_SYNC_COLUMNS,
     SCHEMA_VERSION,
     STATUS_MERGE_COLUMNS,
     WORKFLOW_COLUMNS,
     WORKFLOW_COMMENT_COLUMNS,
-    add_update_run,
-    add_workflow_history,
-    connect,
-    dedupe_workflows,
-    delete_docflow_sync_state,
-    get_open_workflows,
-    get_pending_workflows,
-    init_db,
-    load_docflow_sync_state,
-    load_update_runs,
-    load_workflow_comments,
-    load_workflows,
-    resolve_db_path,
-    upsert_docflow_sync_state,
-    upsert_workflow,
-    upsert_workflow_comment,
 )
 
 __all__ = [
